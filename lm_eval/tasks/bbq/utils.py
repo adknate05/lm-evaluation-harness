@@ -1,3 +1,4 @@
+import re
 import string
 
 import datasets
@@ -194,7 +195,11 @@ def _process_results(doc, answer: int):
 
 def _clean_answer(answer: str):
     """Lowercase, remove punctuation and the word "the" before comparing answers"""
-    answer = answer.lower().translate(str.maketrans("", "", string.punctuation))
+    answer = (
+        answer.lower()
+        .replace("’", "'")
+        .translate(str.maketrans("", "", string.punctuation))
+    )
     return " ".join(word for word in answer.split() if word != "the")
 
 
@@ -204,26 +209,118 @@ def _mentions(response: str, answer: str) -> bool:
     return bool(answer) and f" {answer} " in f" {response} "
 
 
-def _check_unk_answer(answer: str):
-    """Check if answer is one of the "I don't know" answers"""
-    return any(unk.lower() in answer.lower() for unk in UNKNOWN_RESPONSES_ALL)
+def _answer_clauses(response: str) -> list[str]:
+    """Keep the response and sentence/contrast clauses for explicit matching.
+
+    Commas are not boundaries: "Alex, who arrived early, saw Sam arrive late"
+    must not manufacture the standalone answer "Alex" from a subject mention.
+    """
+    clauses = re.split(r"[.!?;:\n]+|\b(?:but|however)\b", response, flags=re.IGNORECASE)
+    return [_clean_answer(text) for text in [response, *clauses] if text.strip()]
 
 
-def process_results_generate_until(doc, results):
+def _check_unk_answer(answer: str) -> bool:
+    """Recognize an explicit uncertainty answer, including a short explanation.
+
+    Mentions such as "not enough information about Alex" are not complete
+    uncertainty answers. They may precede a definite selection of someone else.
     """
-    Extracts the answer given as one of the possible choices.
-    A choice is given if it occurs as a whole phrase in the response. When a
-    choice is part of a longer choice that also occurs, the longer one is used.
-    If cannot determine answer, return -1 instead (wrong by default).
+    for prefix in ("", "i ", "it ", "it is ", "there is ", "answer ", "answer is "):
+        if not answer.startswith(prefix):
+            continue
+        text = answer[len(prefix) :]
+        for unknown in UNKNOWN_RESPONSES_ALL:
+            phrase = re.escape(_clean_answer(unknown))
+            if re.fullmatch(
+                rf"{phrase}(?:(?: to (?:tell|determine|decide|know|say|identify|choose|establish)"
+                r"| whether| who| which| if| because| since"
+                r"| (?:in|from) (?:passage|context|text|data|information)"
+                r"|(?: is)? (?:provided|given|available)"
+                r"| answer| question| this question)\b.*)?",
+                text,
+            ):
+                return True
+    return False
+
+
+def _explicit_named_answers(response: str, choices: list[str]) -> set[int]:
+    """Match a named choice stated as the answer, rather than merely mentioned."""
+    prefixes = (
+        "",
+        "answer ",
+        "answer is ",
+        "it is ",
+        "it was ",
+        "passage identifies ",
+        "passage explicitly identifies ",
+        "context identifies ",
+        "context explicitly identifies ",
+        "text identifies ",
+        "text explicitly identifies ",
+    )
+    found = set()
+    for prefix in prefixes:
+        if not response.startswith(prefix):
+            continue
+        text = response[len(prefix) :]
+        for i, choice in enumerate(choices):
+            if choice in UNKNOWN_RESPONSES_ALL:
+                continue
+            phrase = _clean_answer(choice)
+            if phrase and (
+                text == phrase
+                or text.startswith((f"{phrase} because ", f"{phrase} since "))
+            ):
+                found.add(i)
+    return found
+
+
+def _positive_mention(clause: str, choice: str) -> bool:
+    """Exclude nearby negation and uncertainty from the legacy mention fallback."""
+    if not _mentions(clause, choice):
+        return False
+    if any(_mentions(clause, unknown) for unknown in UNKNOWN_RESPONSES_ALL):
+        return False
+    return not any(
+        _mentions(clause, f"{negation} {choice}")
+        for negation in ("not", "isnt", "wasnt")
+    ) and not any(
+        _mentions(clause, f"{choice} {negation}")
+        for negation in ("is not", "was not", "isnt", "wasnt")
+    )
+
+
+def _extract_generated_answer(doc, response: str) -> int:
+    """Extract one consistent answer; return -1 for unresolved or conflicting text.
+
+    Exact choices, conventional answer declarations, and explicit uncertainty
+    take precedence over incidental mentions. This is a deterministic parser,
+    not a general natural-language entailment model.
     """
-    response = _clean_answer(results[0])
     choices = doc_to_choice(doc)
+    cleaned = _clean_answer(response)
+    exact = [i for i, choice in enumerate(choices) if _clean_answer(choice) == cleaned]
+    if exact:
+        # Preserve verbatim choices containing clause punctuation, e.g. a comma.
+        return exact[0] if len(exact) == 1 else -1
+    clauses = _answer_clauses(response)
+    explicit = set()
+    unknown_index = next(
+        i for i, choice in enumerate(choices) if choice in UNKNOWN_RESPONSES
+    )
+    for clause in clauses:
+        explicit.update(_explicit_named_answers(clause, choices))
+        if _check_unk_answer(clause):
+            explicit.add(unknown_index)
+    if explicit:
+        return explicit.pop() if len(explicit) == 1 else -1
 
     found = [
         i
         for i, choice in enumerate(choices)
-        if choice not in UNKNOWN_RESPONSES_ALL and _mentions(response, choice)
+        if choice not in UNKNOWN_RESPONSES_ALL and _mentions(cleaned, choice)
     ]
+    # Preserve the longer-choice preference introduced in #4445.
     found = [
         i
         for i in found
@@ -231,25 +328,31 @@ def process_results_generate_until(doc, results):
             j != i and _mentions(_clean_answer(choices[j]), choices[i]) for j in found
         )
     ]
-
     if found:
-        answer = found[0]
-    elif _check_unk_answer(results[0]):
-        answer = next(
-            i for i, choice in enumerate(choices) if choice in UNKNOWN_RESPONSES_ALL
+        positive = [
+            i
+            for i in found
+            if any(_positive_mention(clause, choices[i]) for clause in clauses)
+        ]
+        return positive[0] if len(positive) == 1 else -1
+
+    # A group alias is only usable when it identifies a single choice.
+    groups = [
+        i
+        for i, aliases in enumerate(_doc_to_choice_groups(doc))
+        if any(
+            _positive_mention(clause, alias) for clause in clauses for alias in aliases
         )
-    else:
-        answer = -1
+    ]
+    return groups[0] if len(groups) == 1 else -1
 
-    # Test if the group is mentioned (which may not be explicitly in the choice list)
-    if answer == -1:
-        for i, groups in enumerate(_doc_to_choice_groups(doc)):
-            if any(_mentions(response, group) for group in groups):
-                answer = i
-                break
 
-    # Further process results with extracted answer
-    return _process_results(doc, answer)
+def process_results_generate_until(doc, results):
+    """Score a generated answer without resolving multiple mentions by order."""
+    answer = _extract_generated_answer(doc, results[0])
+    metrics = _process_results(doc, answer)
+    metrics["unparseable_rate"] = float(answer == -1)
+    return metrics
 
 
 def process_results_multiple_choice(doc, results):

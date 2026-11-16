@@ -9,8 +9,11 @@ doc_to_text: "{{context}}\n\nQ: {{question}}\nA:"
 doc_to_target: !function utils.doc_to_target
 doc_to_choice: !function utils.doc_to_choice
 metadata:
-  version: 1.1
+  version: 1.2
 metric_list:
+  - metric: unparseable_rate
+    aggregation: mean
+    higher_is_better: false
   - metric: acc
     aggregation: mean
     higher_is_better: true
